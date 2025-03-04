@@ -1,0 +1,8 @@
+# Redis Configuration
+REDIS_ADDRESS=localhost:6379
+REDIS_PASSWORD=
+# Server Configuration
+SERVER_PORT=8080
+# Set your Google Application Credentials environment variable
+# or provide the path to your credentials file
+GOOGLE_APPLICATION_CREDENTIALS=./credentials.json
