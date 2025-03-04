@@ -95,6 +95,21 @@ If `source_lang` is omitted, the service will auto-detect the source language.
 }
 ```
 
+## EXAMPLE `curl`
+
+```
+curl -X POST \
+  http://localhost:8080/translate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello, world!",
+    "source_lang": "en",
+    "target_lang": "es"
+  }' \
+  -o response.json
+```
+
+
 ### Health Check
 
 **Endpoint**: `GET /health`

@@ -29,7 +29,7 @@ RUN apk --no-cache add ca-certificates
 COPY --from=builder /app/translation-service /app/
 
 # Copy .env file if exists (optional)
-COPY --from=builder /app/.env* /app/ 2>/dev/null || true
+COPY --from=builder /app/.env* /app/
 
 # Expose the port
 EXPOSE 8080
