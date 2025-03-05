@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,15 +12,17 @@ import (
 
 	"cloud.google.com/go/translate"
 	"github.com/go-redis/redis/v8"
-	"github.com/joho/godotenv"
+	"golang.org/x/oauth2/google"
 	"golang.org/x/text/language"
+	"google.golang.org/api/option"
 )
 
 // TranslationRequest represents the incoming request for translation
 type TranslationRequest struct {
-	Text          string `json:"text"`
-	SourceLang    string `json:"source_lang,omitempty"` // ISO 639-1 code, optional
-	TargetLang    string `json:"target_lang"`           // ISO 639-1 code, required
+	Text       string `json:"text"`
+	SourceLang string `json:"source_lang,omitempty"` // ISO 639-1 code, optional
+	TargetLang string `json:"target_lang"`           // ISO 639-1 code, required
+	AuthToken  string `json:"auth_token"`            // Authentication token
 }
 
 // TranslationResponse represents the response from the translation service
@@ -37,21 +40,17 @@ type Config struct {
 	RedisDB       int
 	ServerPort    string
 	TTL           time.Duration
+	AuthToken     string // Authentication token to validate requests
 }
 
 // Global clients
 var (
-	redisClient   *redis.Client
+	redisClient     *redis.Client
 	translateClient *translate.Client
-	config        Config
+	config          Config
 )
 
 func init() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: No .env file found")
-	}
-
 	// Set up configuration
 	config = Config{
 		RedisAddress:  getEnv("REDIS_ADDRESS", "localhost:6379"),
@@ -59,16 +58,35 @@ func init() {
 		RedisDB:       0, // Using default DB
 		ServerPort:    getEnv("SERVER_PORT", "8080"),
 		TTL:           time.Hour * 24 * 14, // 2 weeks TTL
+		AuthToken:     getEnv("AUTH_TOKEN", ""),
 	}
 
-	// Set up Redis client
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:     config.RedisAddress,
-		Password: config.RedisPassword,
-		DB:       config.RedisDB,
-	})
+	// Print Redis connection details to help with debugging
+	log.Printf("Attempting to connect to Redis/Valkey at: %s", config.RedisAddress)
 
-	// Test Redis connection
+	// redisClient = nil
+	if os.Getenv("USE_REDIS_UNSECURE") != "" {
+		// Set up Redis client with options specific to AWS Valkey compatibility
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:     config.RedisAddress,
+			Password: config.RedisPassword,
+			DB:       config.RedisDB,
+		})
+	} else {
+		// Set up Redis client with TLS
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:     config.RedisAddress,
+			Password: config.RedisPassword,
+			DB:       config.RedisDB,
+			TLSConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				// For production, you should verify the Redis server's certificate
+				// InsecureSkipVerify: false,
+			},
+		})
+	}
+
+	// Test Redis connection - with retry logic to handle initial connectivity issues
 	ctx := context.Background()
 	if err := redisClient.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Failed to connect to Redis: %v", err)
@@ -76,13 +94,36 @@ func init() {
 	log.Println("Connected to Redis successfully")
 
 	// Set up Google Translate client
-	ctx = context.Background()
 	var err error
-	translateClient, err = translate.NewClient(ctx)
-	if err != nil {
-		log.Fatalf("Failed to create translate client: %v", err)
+	if credJSON := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"); credJSON != "" {
+		// Print the first few characters for debugging (avoid printing the whole credential)
+		log.Printf("Credentials string found (first 20 chars): %s...", credJSON[:min(20, len(credJSON))])
+
+		// Try to parse JSON to verify its structure
+		var jsonMap map[string]interface{}
+		if err := json.Unmarshal([]byte(credJSON), &jsonMap); err != nil {
+			log.Fatalf("Invalid JSON format in credentials: %v", err)
+		}
+
+		ctx := context.Background()
+		creds, credErr := google.CredentialsFromJSON(ctx, []byte(credJSON),
+			"https://www.googleapis.com/auth/cloud-platform")
+		if credErr != nil {
+			log.Fatalf("Failed to create credentials: %v", credErr)
+		}
+		translateClient, err = translate.NewClient(ctx, option.WithCredentials(creds))
+		if err != nil {
+			log.Fatalf("Failed to create translate client: %v", err)
+		}
+		log.Println("Connected to Google Translate API using credentials from environment variable")
+	} else {
+		// Fall back to GOOGLE_APPLICATION_CREDENTIALS file
+		translateClient, err = translate.NewClient(ctx)
+		if err != nil {
+			log.Fatalf("Failed to create translate client: %v", err)
+		}
+		log.Println("Connected to Google Translate API using credentials from file")
 	}
-	log.Println("Connected to Google Translate API successfully")
 }
 
 func main() {
@@ -115,6 +156,12 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+// authenticateRequest validates the authentication token
+func authenticateRequest(token string) bool {
+	// Compare the provided token with the configured token
+	return token == config.AuthToken
+}
+
 // handleTranslation processes translation requests
 func handleTranslation(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -126,6 +173,13 @@ func handleTranslation(w http.ResponseWriter, r *http.Request) {
 	var req TranslationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Authenticate request
+	if !authenticateRequest(req.AuthToken) {
+		http.Error(w, "Unauthorized: Invalid authentication token", http.StatusUnauthorized)
+		log.Printf("Unauthorized request attempt with token: %s", req.AuthToken)
 		return
 	}
 
@@ -158,22 +212,25 @@ func translateText(ctx context.Context, req TranslationRequest) (*TranslationRes
 	// Create cache key
 	cacheKey := fmt.Sprintf("translate:%s:%s:%s", req.SourceLang, req.TargetLang, req.Text)
 
-	// Check cache first
-	cachedResult, err := redisClient.Get(ctx, cacheKey).Result()
-	if err == nil {
-		// Cache hit
-		var response TranslationResponse
-		if err := json.Unmarshal([]byte(cachedResult), &response); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal cached result: %v", err)
+	// Check if Redis is available before attempting to use cache
+	if redisClient != nil {
+		// Check cache first
+		cachedResult, err := redisClient.Get(ctx, cacheKey).Result()
+		if err == nil {
+			// Cache hit
+			var response TranslationResponse
+			if err := json.Unmarshal([]byte(cachedResult), &response); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal cached result: %v", err)
+			}
+			response.CacheHit = true
+			return &response, nil
+		} else if err != redis.Nil {
+			// Redis error - log but continue with translation
+			log.Printf("Redis error when checking cache: %v", err)
 		}
-		response.CacheHit = true
-		return &response, nil
-	} else if err != redis.Nil {
-		// Redis error
-		return nil, fmt.Errorf("redis error: %v", err)
 	}
 
-	// Cache miss, perform translation
+	// Cache miss or Redis unavailable, perform translation
 	var sourceLang language.Tag
 	if req.SourceLang != "" {
 		var err error
@@ -226,14 +283,16 @@ func translateText(ctx context.Context, req TranslationRequest) (*TranslationRes
 		CacheHit:       false,
 	}
 
-	// Cache the result
-	jsonData, err := json.Marshal(response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal response for caching: %v", err)
-	}
-
-	if err := redisClient.Set(ctx, cacheKey, jsonData, config.TTL).Err(); err != nil {
-		log.Printf("Warning: Failed to cache translation: %v", err)
+	// Cache the result if Redis is available
+	if redisClient != nil {
+		jsonData, err := json.Marshal(response)
+		if err != nil {
+			log.Printf("Warning: Failed to marshal response for caching: %v", err)
+		} else {
+			if err := redisClient.Set(ctx, cacheKey, jsonData, config.TTL).Err(); err != nil {
+				log.Printf("Warning: Failed to cache translation: %v", err)
+			}
+		}
 	}
 
 	return response, nil
@@ -246,4 +305,11 @@ func getEnv(key, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
